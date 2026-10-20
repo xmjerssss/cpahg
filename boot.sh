@@ -37,7 +37,6 @@ fi
 mkdir -p /data/auth-files /app/auths /root/.cli-proxy-api ~/.cli-proxy-api /CLIProxyAPI /var/log/nginx
 SECRET="${SECRET_KEY:-112325}"
 
-# 预生成兜底初始配置
 cat <<EOF > /app/config.yaml
 port: 7862
 host: "127.0.0.1"
@@ -101,7 +100,6 @@ def do_restore():
     url = INITIAL_URL
     backups = list_remote(url)
 
-    # 兜底回退：如果子路径无文件，自动尝试上级根目录
     if not backups and url.count("/") > 4:
         parts = url.strip("/").split("/")
         root_url = "/".join(parts[:4]) + "/"
@@ -135,7 +133,6 @@ def do_restore():
         tar.extractall("/")
     print(f"{t()}[Restore] Successfully unpacked to system.")
 
-    # 关键补丁：修正解压出的 35KB config.yaml 端口为 7862（配合 Nginx 反代），保留原有的全部渠道配置
     cfg_file = "/app/config.yaml"
     if os.path.exists(cfg_file):
         with open(cfg_file, "r", encoding="utf-8") as f:
@@ -165,4 +162,64 @@ def do_backup():
     if not has_files: return
 
     with open(tmp, "rb") as f:
-        r = requests.put(f"{INITIAL_URL}{fname}", auth=(USER
+        r = requests.put(f"{INITIAL_URL}{fname}", auth=(USER, PASS), data=f, timeout=180)
+    print(f"{t()}[Backup] Upload {fname} -> HTTP {r.status_code}")
+    if os.path.exists(tmp): os.remove(tmp)
+
+    try:
+        remotes = list_remote(INITIAL_URL)
+        if len(remotes) > MAX:
+            for old in remotes[:-MAX]:
+                requests.request("DELETE", f"{INITIAL_URL}{old}", auth=(USER, PASS), timeout=20)
+    except Exception: pass
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "restore": do_restore()
+        elif sys.argv[1] == "backup": do_backup()
+PYEOF
+
+# ==========================================
+# 4. 执行数据恢复与多路径全兼容绑定
+# ==========================================
+if [[ "$WEBDAV_CONFIGURED" == "true" ]]; then
+    log "[System] Running restore routine..."
+    "$PY" /tmp/_bkengine.py restore
+
+    mkdir -p /CLIProxyAPI
+    cp -f /app/config.yaml /CLIProxyAPI/config.yaml 2>/dev/null || true
+    ln -sf /app/config.yaml /CLIProxyAPI/config.yaml 2>/dev/null || true
+
+    log "[System] Bridging auth credential directories..."
+    cp -rn /root/.cli-proxy-api/* /data/auth-files/ 2>/dev/null || true
+    cp -rn /app/auths/* /data/auth-files/ 2>/dev/null || true
+    cp -rn /data/auth-files/* /root/.cli-proxy-api/ 2>/dev/null || true
+    chmod -R 777 /data /root/.cli-proxy-api /app/auths /app/config.yaml /CLIProxyAPI 2>/dev/null || true
+
+    (
+        trap 'exit 0' TERM INT
+        INTERVAL=${SYNC_INTERVAL:-3600}
+        while true; do
+            sleep "$INTERVAL"
+            "$PY" /tmp/_bkengine.py backup || true
+        done
+    ) &
+    log "[Daemon] Backup daemon started."
+fi
+
+# ==========================================
+# 5. 启动核心服务（显式加载恢复出的 config.yaml）
+# ==========================================
+log "[System] Launching core service on 127.0.0.1:7862 with config..."
+cd /app
+"${SERVER_BIN}" -config /app/config.yaml > /tmp/server.log 2>&1 &
+
+sleep 2
+log "[System] Core service startup log preview:"
+head -n 25 /tmp/server.log || true
+
+# ==========================================
+# 6. 启动前台 Nginx 反向代理
+# ==========================================
+log "[System] Launching Nginx on 0.0.0.0:7860 ..."
+exec nginx -g "daemon off;"
