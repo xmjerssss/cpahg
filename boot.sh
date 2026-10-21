@@ -35,7 +35,7 @@ fi
 # 2. 初始化运行环境与各挂载目录
 # ==========================================
 mkdir -p /data/auth-files /app/auths /root/.cli-proxy-api ~/.cli-proxy-api /CLIProxyAPI /var/log/nginx
-SECRET="${SECRET_KEY:-112325}"
+export SECRET="${SECRET_KEY:-112325}"
 
 cat <<EOF > /app/config.yaml
 port: 7862
@@ -57,6 +57,7 @@ INITIAL_URL = os.environ.get("FULL_WEBDAV_URL", "").strip().rstrip("/") + "/"
 USER        = os.environ.get("WEBDAV_USERNAME", "").strip()
 PASS        = os.environ.get("WEBDAV_PASSWORD", "").strip()
 PFX         = os.environ.get("BACKUP_PREFIX", "cilicili_data_")
+SECRET      = os.environ.get("SECRET", "112325").strip()
 MAX         = int(os.environ.get("MAX_BACKUPS", "5"))
 
 BACKUP_PATHS = [
@@ -71,12 +72,9 @@ def t():
 
 def list_remote(url):
     if not url: return []
-    print(f"{t()}[WebDAV] PROPFIND -> {url}")
     try:
         r = requests.request("PROPFIND", url, auth=(USER, PASS), headers={"Depth": "1"}, timeout=25, allow_redirects=True)
-        print(f"{t()}[WebDAV] PROPFIND HTTP status: {r.status_code}")
-        if r.status_code not in (200, 207):
-            return []
+        if r.status_code not in (200, 207): return []
 
         hrefs = re.findall(r"<[^:>]*:?href[^>]*>([^<]+)</[^:>]*:?href>", r.text, re.I)
         if not hrefs:
@@ -93,7 +91,6 @@ def list_remote(url):
 
         return sorted(list(set(backups)))
     except Exception as e:
-        print(f"{t()}[WebDAV] Exception: {e}")
         return []
 
 def do_restore():
@@ -103,7 +100,6 @@ def do_restore():
     if not backups and url.count("/") > 4:
         parts = url.strip("/").split("/")
         root_url = "/".join(parts[:4]) + "/"
-        print(f"{t()}[Auto-Fallback] Subdir empty, trying: {root_url}")
         root_backups = list_remote(root_url)
         if root_backups:
             url = root_url
@@ -118,9 +114,7 @@ def do_restore():
     tmp = f"/tmp/{latest}"
 
     r = requests.get(f"{url}{latest}", auth=(USER, PASS), stream=True, timeout=180, allow_redirects=True)
-    if r.status_code != 200:
-        print(f"{t()}[Restore] Download failed: HTTP {r.status_code}")
-        return
+    if r.status_code != 200: return
 
     with open(tmp, "wb") as f:
         for chunk in r.iter_content(65536):
@@ -133,19 +127,21 @@ def do_restore():
         tar.extractall("/")
     print(f"{t()}[Restore] Successfully unpacked to system.")
 
+    # 关键补丁：修正端口为 7862，并强制将密码锁定为统一的 SECRET 变量
     cfg_file = "/app/config.yaml"
     if os.path.exists(cfg_file):
         with open(cfg_file, "r", encoding="utf-8") as f:
             c = f.read()
         c = re.sub(r'port:\s*\d+', 'port: 7862', c)
         c = re.sub(r'host:\s*["\']?[^"\'\n]+["\']?', 'host: "127.0.0.1"', c)
+        c = re.sub(r'secret-key:\s*["\']?[^"\'\n]+["\']?', f'secret-key: "{SECRET}"', c)
         if "auth-dir:" not in c:
             c += '\nauth-dir: "/data/auth-files"\n'
         else:
             c = re.sub(r'auth-dir:\s*["\']?[^"\'\n]+["\']?', 'auth-dir: "/data/auth-files"', c)
         with open(cfg_file, "w", encoding="utf-8") as f:
             f.write(c)
-        print(f"{t()}[Restore] Patched /app/config.yaml (port: 7862, auth-dir: /data/auth-files, size: {len(c)} bytes)")
+        print(f"{t()}[Restore] Config patched. Port: 7862, Active Password locked to: {SECRET}")
 
 def do_backup():
     ts = time.strftime("%Y%m%d_%H%M%S")
@@ -163,7 +159,6 @@ def do_backup():
 
     with open(tmp, "rb") as f:
         r = requests.put(f"{INITIAL_URL}{fname}", auth=(USER, PASS), data=f, timeout=180)
-    print(f"{t()}[Backup] Upload {fname} -> HTTP {r.status_code}")
     if os.path.exists(tmp): os.remove(tmp)
 
     try:
@@ -208,18 +203,13 @@ if [[ "$WEBDAV_CONFIGURED" == "true" ]]; then
 fi
 
 # ==========================================
-# 5. 启动核心服务（显式加载恢复出的 config.yaml）
+# 5. 启动核心服务并明确打印登录密码
 # ==========================================
+log "[System] Active Management Login Password is: ${SECRET}"
 log "[System] Launching core service on 127.0.0.1:7862 with config..."
 cd /app
 "${SERVER_BIN}" -config /app/config.yaml > /tmp/server.log 2>&1 &
 
 sleep 2
-log "[System] Core service startup log preview:"
-head -n 25 /tmp/server.log || true
-
-# ==========================================
-# 6. 启动前台 Nginx 反向代理
-# ==========================================
 log "[System] Launching Nginx on 0.0.0.0:7860 ..."
 exec nginx -g "daemon off;"
